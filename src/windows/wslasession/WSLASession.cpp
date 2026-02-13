@@ -357,110 +357,109 @@ try
 {
     COMServiceExecutionContext context;
 
-    RETURN_HR_IF(E_INVALIDARG, ContextHandle == 0);
-
-    std::optional<std::string> dockerfilePath;
-    if (DockerfilePath != nullptr && *DockerfilePath != '\0')
-    {
-        dockerfilePath = std::string(DockerfilePath);
-    }
-
-    std::optional<std::string> tag;
-    if (ImageTag != nullptr && *ImageTag != '\0')
-    {
-        tag = std::string(ImageTag);
-    }
-
     std::lock_guard lock{m_lock};
 
-    THROW_HR_IF(HRESULT_FROM_WIN32(ERROR_INVALID_STATE), !m_dockerClient.has_value());
+    THROW_HR_IF(HRESULT_FROM_WIN32(ERROR_INVALID_STATE), !m_virtualMachine);
 
     wil::unique_handle contextFileHandle{wsl::windows::common::wslutil::DuplicateHandleFromCallingProcess(ULongToHandle(ContextHandle))};
 
-    auto requestContext = m_dockerClient->BuildImage(ContentLength, dockerfilePath, tag);
+    std::string buildCmd = "DOCKER_BUILDKIT=1 docker build";
+    if (ImageTag != nullptr && *ImageTag != '\0')
+    {
+        buildCmd += " -t " + std::string(ImageTag);
+    }
+    if (DockerfilePath != nullptr && *DockerfilePath != '\0')
+    {
+        buildCmd += " -f " + std::string(DockerfilePath);
+    }
+    buildCmd += " -";
+
+    WSL_LOG("BuildImageStart", TraceLoggingValue(buildCmd.c_str(), "Command"));
+
+    ServiceProcessLauncher buildLauncher("/usr/bin/sh", {"/usr/bin/sh", "-c", buildCmd}, {}, WSLAProcessFlagsStdin);
+    auto buildProcess = buildLauncher.Launch(*m_virtualMachine);
+    auto buildStdin = buildProcess.GetStdHandle(0);
+
+    std::vector<char> buffer(64 * 1024);
+    DWORD totalWritten = 0;
+    while (totalWritten < ContentLength)
+    {
+        DWORD toRead = static_cast<DWORD>(std::min<ULONGLONG>(buffer.size(), ContentLength - totalWritten));
+        DWORD bytesRead = 0;
+        THROW_LAST_ERROR_IF(!ReadFile(contextFileHandle.get(), buffer.data(), toRead, &bytesRead, nullptr));
+        if (bytesRead == 0)
+        {
+            break;
+        }
+
+        DWORD bytesWritten = 0;
+        THROW_LAST_ERROR_IF(!WriteFile(buildStdin.get(), buffer.data(), bytesRead, &bytesWritten, nullptr));
+        totalWritten += bytesRead;
+    }
+    buildStdin.reset();
 
     relay::MultiHandleWait io;
+    std::string allOutput;
 
-    std::optional<boost::beast::http::status> buildResult;
-
-    auto onHttpResponse = [&](const boost::beast::http::message<false, boost::beast::http::buffer_body>& response) {
-        WSL_LOG("BuildHttpResponse", TraceLoggingValue(static_cast<int>(response.result()), "StatusCode"));
-
-        buildResult = response.result();
+    auto contains = [](const std::string& str, std::initializer_list<const char*> keywords) {
+        return std::ranges::any_of(keywords, [&](const char* k) { return str.find(k) != std::string::npos; });
     };
 
-    std::string errorJson;
-    std::string lastStreamMessage;
+    std::set<std::string> reportedSteps;
 
-    auto onChunk = [&](const gsl::span<char>& Content) {
-        if (buildResult.has_value() && buildResult.value() != boost::beast::http::status::ok)
+    auto captureOutput = [&](const gsl::span<char>& content) {
+        std::string line{content.begin(), content.end()};
+        allOutput.append(line).append("\n");
+
+        if (line.empty() || line[0] != '#')
         {
-            // If the status code is an error, then this is an error message, not a progress update.
-            errorJson.append(Content.data(), Content.size());
             return;
         }
 
-        std::string contentString{Content.begin(), Content.end()};
-        WSL_LOG(
-            "ImageBuildProgress",
-            TraceLoggingValue(ImageTag != nullptr ? ImageTag : "(no tag)", "Image"),
-            TraceLoggingValue(contentString.c_str(), "Content"));
-
-        auto parsed = wsl::shared::FromJson<docker_schema::BuildProgress>(contentString.c_str());
-
-        if (!parsed.stream.empty())
+        auto stepNumEnd = line.find(' ');
+        if (stepNumEnd == std::string::npos)
         {
-            lastStreamMessage = parsed.stream;
-            if (ProgressCallback != nullptr)
-            {
-                THROW_IF_FAILED(ProgressCallback->OnProgress(parsed.stream.c_str(), "", 0, 0));
-            }
+            return;
         }
 
-        if (!parsed.error.empty())
+        auto stepNum = line.substr(0, stepNumEnd);
+        auto rest = line.substr(stepNumEnd + 1);
+
+        // Show step descriptions once, skip internal steps and status-only lines
+        if (rest[0] == '[' && !contains(rest, {"[internal]"}) && reportedSteps.insert(stepNum).second)
         {
-            errorJson = parsed.error;
+            if (ProgressCallback != nullptr)
+            {
+                LOG_IF_FAILED(ProgressCallback->OnProgress((rest + "\n").c_str(), "", 0, 0));
+            }
+        }
+        else if (contains(rest, {"ERROR", "WARN"}))
+        {
+            if (ProgressCallback != nullptr)
+            {
+                LOG_IF_FAILED(ProgressCallback->OnProgress((rest + "\n").c_str(), "", 0, 0));
+            }
         }
     };
 
-    auto onCompleted = [&]() { io.Cancel(); };
-
-    io.AddHandle(std::make_unique<relay::RelayHandle<relay::ReadHandle>>(
-        common::relay::HandleWrapper{std::move(contextFileHandle)}, common::relay::HandleWrapper{requestContext->stream.native_handle()}));
+    io.AddHandle(std::make_unique<relay::LineBasedReadHandle>(buildProcess.GetStdHandle(1), captureOutput, false));
+    io.AddHandle(std::make_unique<relay::LineBasedReadHandle>(buildProcess.GetStdHandle(2), captureOutput, false));
 
     io.AddHandle(std::make_unique<relay::EventHandle>(m_sessionTerminatingEvent.get(), [&]() { THROW_HR(E_ABORT); }));
 
-    io.AddHandle(std::make_unique<DockerHTTPClient::DockerHttpResponseHandle>(
-        *requestContext, std::move(onHttpResponse), std::move(onChunk), std::move(onCompleted)));
+    io.AddHandle(std::make_unique<relay::EventHandle>(buildProcess.GetExitEvent(), [&]() { io.Cancel(); }));
 
     io.Run({});
 
-    THROW_HR_IF(E_UNEXPECTED, !buildResult.has_value());
+    int exitCode = buildProcess.GetExitCode();
+    WSL_LOG("BuildImageComplete", TraceLoggingValue(exitCode, "ExitCode"));
+    THROW_HR_WITH_USER_ERROR_IF(E_FAIL, allOutput, exitCode != 0);
 
-    WSL_LOG(
-        "BuildCompleted",
-        TraceLoggingValue(static_cast<int>(buildResult.value()), "StatusCode"),
-        TraceLoggingValue(errorJson.c_str(), "ErrorJson"),
-        TraceLoggingValue(lastStreamMessage.c_str(), "LastStreamMessage"));
-
-    if (buildResult.value() != boost::beast::http::status::ok || !errorJson.empty())
+    if (ProgressCallback != nullptr)
     {
-        std::string errorMessage = !errorJson.empty() ? std::move(errorJson) : std::move(lastStreamMessage);
-
-        // For HTTP-level errors, the error body is a JSON object - parse the message from it.
-        if (buildResult.value() != boost::beast::http::status::ok)
-        {
-            try
-            {
-                errorMessage = wsl::shared::FromJson<docker_schema::ErrorResponse>(errorMessage.c_str()).message;
-            }
-            catch (...)
-            {
-                LOG_CAUGHT_EXCEPTION();
-            }
-        }
-
-        THROW_HR_WITH_USER_ERROR(E_FAIL, errorMessage);
+        std::string tag = (ImageTag != nullptr && *ImageTag != '\0') ? ImageTag : "";
+        auto message = tag.empty() ? "Build complete.\n" : "Build complete: " + tag + "\n";
+        LOG_IF_FAILED(ProgressCallback->OnProgress(message.c_str(), "", 0, 0));
     }
 
     return S_OK;

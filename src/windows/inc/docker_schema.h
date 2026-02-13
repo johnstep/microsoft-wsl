@@ -264,12 +264,4 @@ struct CreateImageProgress
     NLOHMANN_DEFINE_TYPE_INTRUSIVE_WITH_DEFAULT(CreateImageProgress, status, id, progressDetail);
 };
 
-struct BuildProgress
-{
-    std::string stream;
-    std::string error;
-
-    NLOHMANN_DEFINE_TYPE_INTRUSIVE_WITH_DEFAULT(BuildProgress, stream, error);
-};
-
 } // namespace wsl::windows::common::docker_schema
