@@ -245,6 +245,23 @@ struct ContainerInfo
     NLOHMANN_DEFINE_TYPE_INTRUSIVE_WITH_DEFAULT(ContainerInfo, Id, Names, Image, Labels, Ports, State);
 };
 
+struct BuildKitVertex
+{
+    std::string digest;
+    std::string name;
+    std::string started;
+    std::string error;
+
+    NLOHMANN_DEFINE_TYPE_INTRUSIVE_WITH_DEFAULT(BuildKitVertex, digest, name, started, error);
+};
+
+struct BuildKitSolveStatus
+{
+    std::vector<BuildKitVertex> vertexes;
+
+    NLOHMANN_DEFINE_TYPE_INTRUSIVE_WITH_DEFAULT(BuildKitSolveStatus, vertexes);
+};
+
 struct CreateImageProgressDetails
 {
     uint64_t current{};

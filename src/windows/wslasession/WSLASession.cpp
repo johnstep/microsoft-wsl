@@ -363,7 +363,7 @@ try
 
     wil::unique_handle contextFileHandle{wsl::windows::common::wslutil::DuplicateHandleFromCallingProcess(ULongToHandle(ContextHandle))};
 
-    std::string buildCmd = "DOCKER_BUILDKIT=1 docker build";
+    std::string buildCmd = "DOCKER_BUILDKIT=1 docker build --progress=rawjson";
     if (ImageTag != nullptr && *ImageTag != '\0')
     {
         buildCmd += " -t " + std::string(ImageTag);
@@ -400,49 +400,74 @@ try
 
     relay::MultiHandleWait io;
     std::string allOutput;
+    std::string pendingJson;
+    int braceDepth = 0;
+    std::set<std::string> reportedSteps;
+    std::set<std::string> reportedErrors;
 
-    auto contains = [](const std::string& str, std::initializer_list<const char*> keywords) {
-        return std::ranges::any_of(keywords, [&](const char* k) { return str.find(k) != std::string::npos; });
+    auto reportProgress = [&](const std::string& message) {
+        if (ProgressCallback != nullptr)
+        {
+            THROW_IF_FAILED(ProgressCallback->OnProgress(message.c_str(), "", 0, 0));
+        }
     };
 
-    std::set<std::string> reportedSteps;
-
+    // Brace-depth tracking handles pretty-printed rawjson from BuildKit < v0.14.
     auto captureOutput = [&](const gsl::span<char>& content) {
         std::string line{content.begin(), content.end()};
-        allOutput.append(line).append("\n");
 
-        if (line.empty() || line[0] != '#')
+        for (char c : line)
         {
-            return;
-        }
-
-        auto stepNumEnd = line.find(' ');
-        if (stepNumEnd == std::string::npos)
-        {
-            return;
-        }
-
-        auto stepNum = line.substr(0, stepNumEnd);
-        auto rest = line.substr(stepNumEnd + 1);
-
-        // Show step descriptions once, skip internal steps and status-only lines
-        if (rest[0] == '[' && !contains(rest, {"[internal]"}) && reportedSteps.insert(stepNum).second)
-        {
-            if (ProgressCallback != nullptr)
+            if (c == '{')
             {
-                LOG_IF_FAILED(ProgressCallback->OnProgress((rest + "\n").c_str(), "", 0, 0));
+                braceDepth++;
+            }
+            else if (c == '}')
+            {
+                braceDepth--;
             }
         }
-        else if (contains(rest, {"ERROR", "WARN"}))
+
+        pendingJson.append(line);
+
+        if (braceDepth > 0)
         {
-            if (ProgressCallback != nullptr)
+            return;
+        }
+
+        auto text = std::move(pendingJson);
+        pendingJson.clear();
+
+        auto json = nlohmann::json::parse(text, nullptr, false);
+        if (json.is_discarded())
+        {
+            allOutput.append(text).append("\n");
+            return;
+        }
+
+        docker_schema::BuildKitSolveStatus status{};
+        from_json(json, status);
+
+        for (const auto& vertex : status.vertexes)
+        {
+            if (!vertex.started.empty() && reportedSteps.insert(vertex.digest).second)
             {
-                LOG_IF_FAILED(ProgressCallback->OnProgress((rest + "\n").c_str(), "", 0, 0));
+                allOutput.append(vertex.name).append("\n");
+
+                if (vertex.name[0] == '[' && vertex.name.find("[internal]") == std::string::npos)
+                {
+                    reportProgress(vertex.name + "\n");
+                }
+            }
+
+            if (!vertex.error.empty() && reportedErrors.insert(vertex.digest).second)
+            {
+                allOutput.append(vertex.error).append("\n");
+                reportProgress(vertex.error + "\n");
             }
         }
     };
 
-    io.AddHandle(std::make_unique<relay::LineBasedReadHandle>(buildProcess.GetStdHandle(1), captureOutput, false));
     io.AddHandle(std::make_unique<relay::LineBasedReadHandle>(buildProcess.GetStdHandle(2), captureOutput, false));
 
     io.AddHandle(std::make_unique<relay::EventHandle>(m_sessionTerminatingEvent.get(), [&]() { THROW_HR(E_ABORT); }));
@@ -455,12 +480,8 @@ try
     WSL_LOG("BuildImageComplete", TraceLoggingValue(exitCode, "ExitCode"));
     THROW_HR_WITH_USER_ERROR_IF(E_FAIL, allOutput, exitCode != 0);
 
-    if (ProgressCallback != nullptr)
-    {
-        std::string tag = (ImageTag != nullptr && *ImageTag != '\0') ? ImageTag : "";
-        auto message = tag.empty() ? "Build complete.\n" : "Build complete: " + tag + "\n";
-        LOG_IF_FAILED(ProgressCallback->OnProgress(message.c_str(), "", 0, 0));
-    }
+    std::string tag = (ImageTag != nullptr && *ImageTag != '\0') ? ImageTag : "";
+    reportProgress(tag.empty() ? "\nBuild complete.\n" : "\nBuild complete: " + tag + "\n");
 
     return S_OK;
 }
